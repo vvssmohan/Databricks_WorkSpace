@@ -1,0 +1,820 @@
+# Databricks notebook source
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # StructType & StructField in PySpark
+# MAGIC ### RetailPulse India 
+# MAGIC ---
+# MAGIC **What we cover today:**
+# MAGIC - What is StructType and StructField?
+# MAGIC - All StructField parameters explained
+# MAGIC - Flat schema — building and using it
+# MAGIC - One-level nested struct — reading, accessing, flattening
+# MAGIC - Building a struct column from flat columns
+# MAGIC - Parsing a JSON string column into a struct
+# MAGIC - Array of structs + explode
+# MAGIC - Common mistakes and how to fix them
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 1. What Are StructType & StructField?
+# MAGIC
+# MAGIC | Term | What it means |
+# MAGIC |------|--------------|
+# MAGIC | `StructType` | The **schema** of a DataFrame — a list of columns |
+# MAGIC | `StructField` | One **single column** inside that schema |
+# MAGIC
+# MAGIC Think of it exactly like a SQL table definition:
+# MAGIC
+# MAGIC ```sql
+# MAGIC CREATE TABLE orders (
+# MAGIC     order_id   STRING  NOT NULL,   -- StructField('order_id',  StringType(),  False)
+# MAGIC     city       STRING,             -- StructField('city',      StringType(),  True)
+# MAGIC     quantity   INT,                -- StructField('quantity',  IntegerType(), True)
+# MAGIC     unit_price DOUBLE              -- StructField('unit_price',DoubleType(),  True)
+# MAGIC )
+# MAGIC ```
+# MAGIC
+# MAGIC > **Key difference from SQL:** In PySpark, a column's type can itself be another `StructType` — that is called a **nested struct**. We will see this in Section 4.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2. StructField — All Parameters
+
+# COMMAND ----------
+
+# StructField signature:
+# StructField(name, dataType, nullable=True, metadata={})
+
+from pyspark.sql.types import (
+    StructType, StructField,
+    StringType, IntegerType, LongType, DoubleType,
+    FloatType, BooleanType, DateType, TimestampType,
+    ArrayType
+)
+
+# name      = column name (must match the data exactly — case-sensitive)
+# dataType  = PySpark type class
+# nullable  = True means the column CAN have nulls (default)
+#             False means nulls are REJECTED — like NOT NULL in SQL
+# metadata  = optional dictionary for documentation
+
+# Examples:
+f1 = StructField('order_id',    StringType(),  False)          # NOT NULL
+f2 = StructField('customer_id', StringType(),  True)           # nullable
+f3 = StructField('quantity',    IntegerType(), True)
+f4 = StructField('unit_price',  DoubleType(),  True)
+f5 = StructField('unit_price',  DoubleType(),  True,
+                 metadata={'unit': 'INR', 'description': 'Price before GST'})  # with metadata
+
+print(f1)
+print(f2)
+print(f5)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2.1  All Common DataTypes
+
+# COMMAND ----------
+
+# Run this cell to see all common types in one place
+
+type_examples = {
+    "StringType()":        "Names, IDs, status, city, category",
+    "IntegerType()":       "Quantities, counts, ages, small IDs",
+    "LongType()":          "Large integers, epoch timestamps",
+    "DoubleType()":        "Prices, percentages, lat/lon",
+    "FloatType()":         "Lower-precision decimals",
+    "BooleanType()":       "is_active, has_gst, is_returned flags",
+    "DateType()":          "order_date, dob, registration_date",
+    "TimestampType()":     "created_at, updated_at, event_time",
+    "ArrayType(t)":        "List of tags, list of items, multi-values",
+    "StructType([...])":   "Nested object — address, contact, dimensions",
+}
+
+print(f"{'PySpark Type':<30}  Use Case")
+print("-" * 70)
+for k, v in type_examples.items():
+    print(f"  {k:<28}  {v}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## 3. Dataset 1 — Flat Schema (Retail Orders)
+# MAGIC
+# MAGIC We define the schema **explicitly** instead of letting Spark infer it.
+# MAGIC
+# MAGIC **Why bother?**
+# MAGIC - Inference reads the file first → slow on large data
+# MAGIC - Inference can guess types wrongly (e.g. `"001"` inferred as STRING, not INT)
+# MAGIC - Explicit schema = self-documenting code
+
+# COMMAND ----------
+
+# Dataset 1 — 15 flat order rows
+flat_orders_data = [
+    ('ORD001', 'CUST101', 'PROD_A', 'Hyderabad', '2024-01-05', 2, 1500.00, 'Delivered'),
+    ('ORD002', 'CUST102', 'PROD_B', 'Bangalore', '2024-01-07', 1, 3200.00, 'Pending'),
+    ('ORD003', 'CUST103', 'PROD_C', 'Mumbai',    '2024-01-10', 3,  850.00, 'Delivered'),
+    ('ORD004', 'CUST104', 'PROD_A', 'Chennai',   '2024-01-12', 1, 1500.00, 'Cancelled'),
+    ('ORD005', 'CUST105', 'PROD_D', 'Pune',      '2024-01-15', 5,  450.00, 'Delivered'),
+    ('ORD006', 'CUST106', 'PROD_B', 'Hyderabad', '2024-01-18', 2, 3200.00, 'Delivered'),
+    ('ORD007', 'CUST107', 'PROD_E', 'Bangalore', '2024-01-20', 1, 7500.00, 'Pending'),
+    ('ORD008', 'CUST108', 'PROD_C', 'Mumbai',    '2024-01-22', 4,  850.00, 'Delivered'),
+    ('ORD009', 'CUST109', 'PROD_D', 'Chennai',   '2024-01-25', 2,  450.00, 'Delivered'),
+    ('ORD010', 'CUST110', 'PROD_A', 'Pune',      '2024-01-28', 3, 1500.00, 'Cancelled'),
+    ('ORD011', 'CUST101', 'PROD_F', 'Hyderabad', '2024-02-02', 1, 2200.00, 'Delivered'),
+    ('ORD012', 'CUST102', 'PROD_G', 'Bangalore', '2024-02-05', 2,  980.00, 'Pending'),
+    ('ORD013', 'CUST103', 'PROD_B', 'Mumbai',    '2024-02-08', 1, 3200.00, 'Delivered'),
+    ('ORD014', 'CUST104', 'PROD_E', 'Chennai',   '2024-02-10', 2, 7500.00, 'Delivered'),
+    ('ORD015', 'CUST105', 'PROD_C', 'Pune',      '2024-02-14', 6,  850.00, 'Cancelled'),
+]
+
+# COMMAND ----------
+
+from pyspark.sql.functions import *
+
+# COMMAND ----------
+
+# Step 1 — Define the schema explicitly
+orders_schema = StructType([
+    StructField('order_id',    StringType(),  False),   # NOT NULL
+    StructField('customer_id', StringType(),  True),
+    StructField('product_id',  StringType(),  True),
+    StructField('city',        StringType(),  True),
+    StructField('order_date',  StringType(),  True),    # load as string first
+    StructField('quantity',    IntegerType(), True),
+    StructField('unit_price',  DoubleType(),  True),
+    StructField('status',      StringType(),  True),
+])
+
+# Step 2 — Create DataFrame with our schema
+orders_df = spark.createDataFrame(flat_orders_data, schema=orders_schema)
+
+# Step 3 — Cast order_date string to DateType
+orders_df = orders_df.withColumn('order_date', to_date('order_date', 'yyyy-MM-dd'))
+
+orders_df.printSchema()
+
+
+# COMMAND ----------
+
+orders_df.display()
+
+# COMMAND ----------
+
+# INSTRUCTOR: Walk through the printSchema output with students
+# Notice:
+#   order_id  → nullable = false   (we set False)
+#   all others → nullable = true   (default)
+
+orders_df.show(5, truncate=False)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.1  Inspecting the Schema Object Programmatically
+
+# COMMAND ----------
+
+# Access the schema object
+schema = orders_df.schema
+print(type(schema))           # pyspark.sql.types.StructType
+
+print()
+print("All fields:")
+for field in schema.fields:
+    print(f"  Name: {field.name:<15}  Type: {str(field.dataType):<20}  Nullable: {field.nullable}")
+
+# COMMAND ----------
+
+# Access a single field by name
+price_field = schema['unit_price']
+print("Name    :", price_field.name)
+print("Type    :", price_field.dataType)
+print("Nullable:", price_field.nullable)
+
+# COMMAND ----------
+
+# Get just the column names
+print("Column names:", orders_df.columns)
+
+# Get the schema as a JSON string (useful for saving/sharing your schema)
+import json
+schema_as_json = schema.json()
+print("\nSchema JSON:")
+print(json.dumps(json.loads(schema_as_json), indent=2))
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.2  Rebuilding a Schema from a JSON String
+
+# COMMAND ----------
+
+# If you saved a schema as a JSON string, reconstruct it like this
+saved_json = schema_as_json
+
+rebuilt_schema = StructType.fromJson(json.loads(saved_json))
+print("Rebuilt schema matches original:", rebuilt_schema == schema)
+print(rebuilt_schema)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 3.3  Quick Queries on the Flat DataFrame
+
+# COMMAND ----------
+
+# Select specific columns
+orders_df.select('order_id', 'city', 'status', 'unit_price').show(5)
+
+# COMMAND ----------
+
+# Filter — delivered orders only
+orders_df.filter(orders_df['status'] == 'Delivered').show(5)
+
+# COMMAND ----------
+
+# SQL version — register as temp view
+orders_df.createOrReplaceTempView('orders_vw')
+
+spark.sql("""
+    SELECT order_id, city, quantity, unit_price,
+           quantity * unit_price          AS revenue,
+           ROUND(quantity * unit_price * 1.18, 2) AS revenue_with_gst
+    FROM   orders_vw
+    WHERE  status = 'Delivered'
+    ORDER  BY revenue DESC
+""").show(truncate=False)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## 4. One-Level Nested Struct
+# MAGIC
+# MAGIC Instead of having separate columns `ship_street`, `ship_city`, `ship_pincode`, `ship_state`
+# MAGIC we group them all inside **one struct column** called `shipping_address`.
+# MAGIC
+# MAGIC ```
+# MAGIC root
+# MAGIC  |-- order_id: string
+# MAGIC  |-- city: string
+# MAGIC  |-- shipping_address: struct       <-- the struct column
+# MAGIC  |    |-- street:  string
+# MAGIC  |    |-- city:    string
+# MAGIC  |    |-- pincode: string
+# MAGIC  |    |-- state:   string
+# MAGIC ```
+# MAGIC
+# MAGIC > Think of it like a **JSON object embedded inside a table row**.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.1  Dataset 2 — Orders with Nested Shipping Address
+
+# COMMAND ----------
+
+from pyspark.sql import Row
+
+orders_with_address_data = [
+    Row(order_id='ORD001', customer_id='CUST101', city='Hyderabad',
+        quantity=2, unit_price=1500.00, status='Delivered',
+        shipping_address=Row(street='Banjara Hills Rd 12',    city='Hyderabad', pincode='500034', state='Telangana')),
+
+    Row(order_id='ORD002', customer_id='CUST102', city='Bangalore',
+        quantity=1, unit_price=3200.00, status='Pending',
+        shipping_address=Row(street='Koramangala 4th Block',  city='Bangalore', pincode='560034', state='Karnataka')),
+
+    Row(order_id='ORD003', customer_id='CUST103', city='Mumbai',
+        quantity=3, unit_price=850.00, status='Delivered',
+        shipping_address=Row(street='Andheri West Link Rd',   city='Mumbai',    pincode='400058', state='Maharashtra')),
+
+    Row(order_id='ORD004', customer_id='CUST104', city='Chennai',
+        quantity=1, unit_price=1500.00, status='Cancelled',
+        shipping_address=Row(street='Anna Nagar 2nd Ave',     city='Chennai',   pincode='600040', state='Tamil Nadu')),
+
+    Row(order_id='ORD005', customer_id='CUST105', city='Pune',
+        quantity=5, unit_price=450.00, status='Delivered',
+        shipping_address=Row(street='FC Road Deccan',         city='Pune',      pincode='411004', state='Maharashtra')),
+
+    Row(order_id='ORD006', customer_id='CUST106', city='Hyderabad',
+        quantity=2, unit_price=3200.00, status='Delivered',
+        shipping_address=Row(street='Madhapur Hi-Tech City',  city='Hyderabad', pincode='500081', state='Telangana')),
+
+    Row(order_id='ORD007', customer_id='CUST107', city='Bangalore',
+        quantity=1, unit_price=7500.00, status='Pending',
+        shipping_address=Row(street='Indiranagar 100ft Rd',   city='Bangalore', pincode='560038', state='Karnataka')),
+
+    Row(order_id='ORD008', customer_id='CUST108', city='Mumbai',
+        quantity=4, unit_price=850.00, status='Delivered',
+        shipping_address=Row(street='Powai Hiranandani',      city='Mumbai',    pincode='400076', state='Maharashtra')),
+
+    Row(order_id='ORD009', customer_id='CUST109', city='Chennai',
+        quantity=2, unit_price=450.00, status='Delivered',
+        shipping_address=Row(street='T Nagar Usman Road',     city='Chennai',   pincode='600017', state='Tamil Nadu')),
+
+    Row(order_id='ORD010', customer_id='CUST110', city='Pune',
+        quantity=3, unit_price=1500.00, status='Cancelled',
+        shipping_address=Row(street='Hinjewadi Phase 1',      city='Pune',      pincode='411057', state='Maharashtra')),
+]
+
+# COMMAND ----------
+
+
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.2  Defining the Nested Schema
+
+# COMMAND ----------
+
+# Step 1 — Define the INNER struct schema (for shipping_address)
+address_schema = StructType([
+    StructField('street',  StringType(), True),
+    StructField('city',    StringType(), True),
+    StructField('pincode', StringType(), True),
+    StructField('state',   StringType(), True),
+])
+
+# Step 2 — Define the OUTER (top-level) schema
+#           The shipping_address column's dataType = address_schema
+orders_address_schema = StructType([
+    StructField('order_id',         StringType(),  False),
+    StructField('customer_id',      StringType(),  True),
+    StructField('city',             StringType(),  True),
+    StructField('quantity',         IntegerType(), True),
+    StructField('unit_price',       DoubleType(),  True),
+    StructField('status',           StringType(),  True),
+    StructField('shipping_address', address_schema, True),   # <-- NESTED STRUCT
+])
+
+# Step 3 — Create the DataFrame
+orders_addr_df = spark.createDataFrame(orders_with_address_data,
+                                       schema=orders_address_schema)
+
+# COMMAND ----------
+
+# Run printSchema — notice the indented sub-fields under shipping_address
+orders_addr_df.printSchema()
+
+# COMMAND ----------
+
+# Show the raw data — shipping_address appears as a struct object in the row
+orders_addr_df.display()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.3  Accessing Fields Inside a Nested Struct
+# MAGIC
+# MAGIC Use **dot notation** — `parent_column.sub_field`
+
+# COMMAND ----------
+
+# Dot notation inside select() — string form
+orders_addr_df.select('order_id','shipping_address.street','shipping_address.city','shipping_address.pincode'
+).show(5, truncate=False)
+
+# COMMAND ----------
+
+# Dot notation using col() — same result, different style
+from pyspark.sql.functions import col
+
+orders_addr_df.select(
+    col('order_id'),
+    col('shipping_address.street').alias('delivery_street'),
+    col('shipping_address.city').alias('delivery_city'),
+    col('shipping_address.state').alias('state')
+).show(5, truncate=False)
+
+# COMMAND ----------
+
+# Filter on a nested field — same dot notation inside filter()
+orders_addr_df.filter(
+    col('shipping_address.state') == 'Maharashtra'
+).select(
+    'order_id',
+    'shipping_address.city',
+    'status'
+).show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.4  Flattening a Struct — Turning Nested Fields into Top-Level Columns
+
+# COMMAND ----------
+
+# Extract every sub-field of shipping_address as its own top-level column
+flat_df = orders_addr_df.select(
+    'order_id',
+    'customer_id',
+    'city',
+    'quantity',
+    'unit_price',
+    'status',
+    col('shipping_address.street').alias('ship_street'),
+    col('shipping_address.city').alias('ship_city'),
+    col('shipping_address.pincode').alias('ship_pincode'),
+    col('shipping_address.state').alias('ship_state')
+)
+
+flat_df.printSchema()   # no more struct — all columns are flat
+flat_df.display()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 4.5  getField() — Another Way to Access a Sub-Field
+
+# COMMAND ----------
+
+# getField() is equivalent to dot notation — use whichever you prefer
+orders_addr_df.select(
+    'order_id',
+    col('shipping_address').getField('street').alias('street'),
+    col('shipping_address').getField('pincode').alias('pincode')
+).show(5, truncate=False)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## 5. Building a Struct Column from Flat Columns
+# MAGIC
+# MAGIC You already have a flat DataFrame. You want to **group some columns** into a struct.
+# MAGIC Use `struct()` from `pyspark.sql.functions`.
+
+# COMMAND ----------
+
+from pyspark.sql.functions import struct
+
+# Take the flat orders_df and pack order_id + status + order_date into a struct called order_meta
+structured_df = orders_df.withColumn(
+    'order_meta',
+    struct(
+        col('order_id').alias('id'),
+        col('status').alias('order_status'),
+        col('order_date').alias('placed_on')
+    )
+)
+
+structured_df.printSchema()
+
+# COMMAND ----------
+
+# The new struct column appears at the end
+structured_df.select('order_id', 'order_meta').show(5, truncate=False)
+
+# COMMAND ----------
+
+# Access sub-fields of the newly created struct — same dot notation
+structured_df.select(
+    col('order_meta.id'),
+    col('order_meta.order_status'),
+    col('order_meta.placed_on')
+).show(5)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## 6. Parsing a JSON String Column into a Struct  (`from_json`)
+# MAGIC
+# MAGIC **Real-world scenario:** Data arrives from a Kafka topic or REST API as a STRING column
+# MAGIC containing a JSON payload. We use `from_json()` to turn that string into a struct.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 6.1  Dataset 3 — Raw Orders with a JSON Payload Column
+
+# COMMAND ----------
+
+# Simulate: each row has an order_id and a 'payload' column that is a JSON string
+raw_data = [
+    ('ORD001', '{"customer":"Arjun Sharma","city":"Hyderabad","amount":3000.0,"status":"Delivered"}'),
+    ('ORD002', '{"customer":"Priya Iyer","city":"Bangalore","amount":3200.0,"status":"Pending"}'),
+    ('ORD003', '{"customer":"Rohan Mehta","city":"Mumbai","amount":2550.0,"status":"Delivered"}'),
+    ('ORD004', '{"customer":"Sneha Reddy","city":"Chennai","amount":1500.0,"status":"Cancelled"}'),
+    ('ORD005', '{"customer":"Vikram Nair","city":"Pune","amount":2250.0,"status":"Delivered"}'),
+    ('ORD006', '{"customer":"Kavya Rao","city":"Hyderabad","amount":6400.0,"status":"Delivered"}'),
+]
+
+raw_schema = StructType([
+    StructField('order_id', StringType(), False),
+    StructField('payload',  StringType(), True),   # the JSON string lives here
+])
+
+raw_df = spark.createDataFrame(raw_data, schema=raw_schema)
+raw_df.show(truncate=False)
+
+# COMMAND ----------
+
+# Define the schema of the JSON INSIDE the payload column
+from pyspark.sql.functions import from_json, to_json
+
+payload_schema = StructType([
+    StructField('customer', StringType(), True),
+    StructField('city',     StringType(), True),
+    StructField('amount',   DoubleType(), True),
+    StructField('status',   StringType(), True),
+])
+
+# Parse the JSON string into a proper struct column called 'data'
+parsed_df = raw_df.withColumn('data', from_json(col('payload'), payload_schema))
+
+parsed_df.printSchema()
+
+# COMMAND ----------
+
+parsed_df.display()
+# Notice: 'data' column is now a struct, not a raw string
+
+# COMMAND ----------
+
+# Access the parsed fields using dot notation — exactly the same as Section 4
+parsed_df.select(
+    'order_id',
+    col('data.customer').alias('customer_name'),
+    col('data.city').alias('city'),
+    col('data.amount').alias('order_amount'),
+    col('data.status').alias('status')
+).show(truncate=False)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## 7. Array of Structs — Order Line Items
+# MAGIC
+# MAGIC A very common real-world pattern: **one order has multiple products**.
+# MAGIC Instead of one row per product, the order stores an **array of line item structs**.
+# MAGIC
+# MAGIC ```
+# MAGIC root
+# MAGIC  |-- order_id:   string
+# MAGIC  |-- customer:   string
+# MAGIC  |-- line_items: array                    <-- array column
+# MAGIC  |    |-- element: struct
+# MAGIC  |    |    |-- product_id:   string
+# MAGIC  |    |    |-- product_name: string
+# MAGIC  |    |    |-- qty:          integer
+# MAGIC  |    |    |-- price:        double
+# MAGIC ```
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 7.1  Dataset 4 — Orders with Line Items Array
+
+# COMMAND ----------
+
+from pyspark.sql.types import ArrayType
+
+order_items_data = [
+    Row(order_id='ORD001', customer='Arjun Sharma', city='Hyderabad',
+        line_items=[
+            Row(product_id='PROD_A', product_name='Basmati Rice 5kg',    qty=2, price=1500.00),
+            Row(product_id='PROD_D', product_name='Parle-G Biscuits 800g', qty=3, price=450.00),
+        ]),
+
+    Row(order_id='ORD002', customer='Priya Iyer', city='Bangalore',
+        line_items=[
+            Row(product_id='PROD_B', product_name='Samsung Galaxy M34',  qty=1, price=3200.00),
+        ]),
+
+    Row(order_id='ORD003', customer='Rohan Mehta', city='Mumbai',
+        line_items=[
+            Row(product_id='PROD_C', product_name='Tata Salt 1kg',       qty=3, price=850.00),
+            Row(product_id='PROD_F', product_name='Ariel Detergent 2kg', qty=1, price=2200.00),
+            Row(product_id='PROD_G', product_name='Maggi Noodles 12pk',  qty=2, price=980.00),
+        ]),
+
+    Row(order_id='ORD004', customer='Sneha Reddy', city='Chennai',
+        line_items=[
+            Row(product_id='PROD_E', product_name='Boat Airdopes 141',   qty=1, price=7500.00),
+            Row(product_id='PROD_D', product_name='Parle-G Biscuits 800g', qty=5, price=450.00),
+        ]),
+
+    Row(order_id='ORD005', customer='Vikram Nair', city='Pune',
+        line_items=[
+            Row(product_id='PROD_A', product_name='Basmati Rice 5kg',    qty=1, price=1500.00),
+            Row(product_id='PROD_C', product_name='Tata Salt 1kg',       qty=6, price=850.00),
+        ]),
+]
+
+# COMMAND ----------
+
+# Inner struct schema — each line item
+line_item_schema = StructType([
+    StructField('product_id',   StringType(),  True),
+    StructField('product_name', StringType(),  True),
+    StructField('qty',          IntegerType(), True),
+    StructField('price',        DoubleType(),  True),
+])
+
+# Top-level schema — line_items is an ARRAY of the struct above
+order_items_schema = StructType([
+    StructField('order_id',   StringType(),            False),
+    StructField('customer',   StringType(),            True),
+    StructField('city',       StringType(),            True),
+    StructField('line_items', ArrayType(line_item_schema), True),
+])
+
+items_df = spark.createDataFrame(order_items_data, schema=order_items_schema)
+items_df.printSchema()
+
+# COMMAND ----------
+
+items_df.display()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 7.2  Accessing an Array Element by Index
+
+# COMMAND ----------
+
+# Access the FIRST item (index 0) in line_items
+items_df.select(
+    'order_id',
+    col('line_items')[0].alias('first_item')
+).display()
+
+
+items_df.select(
+    'order_id',
+    col('line_items')[0].alias('first_item')
+).select(
+    'order_id',
+    col('first_item.product_name'),
+    col('first_item.qty'),
+    col('first_item.price')
+).display()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 7.3  `explode()` — One Row Per Array Element
+# MAGIC
+# MAGIC `explode()` is the key operation for arrays.  
+# MAGIC It turns **one row with an array of 3 items** into **3 separate rows**.
+
+# COMMAND ----------
+
+items_df.display()
+
+# COMMAND ----------
+
+from pyspark.sql.functions import explode
+
+# explode turns each element of line_items into its own row
+exploded_df = items_df.select(
+    'order_id',
+    'customer',
+    'city',
+    explode(col('line_items')).alias('item')   # one row per line item
+)
+
+exploded_df.printSchema()
+exploded_df.display()
+
+# COMMAND ----------
+
+exploded_df.show(truncate=False)
+# Notice: ORD001 now has 2 rows (one per product), ORD003 has 3 rows, etc.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 7.4  Flatten the Struct After Explode
+
+# COMMAND ----------
+
+# After explode, 'item' is a struct — access its sub-fields with dot notation
+flat_items = exploded_df.select(
+    'order_id',
+    'customer',
+    'city',
+    col('item.product_id').alias('product_id'),
+    col('item.product_name').alias('product_name'),
+    col('item.qty').alias('qty'),
+    col('item.price').alias('price')
+)
+
+flat_items.show(truncate=False)
+
+# COMMAND ----------
+
+# Calculate line total for each item
+from pyspark.sql.functions import round as spark_round
+
+flat_items_with_total = flat_items.withColumn(
+    'line_total',
+    spark_round(col('qty') * col('price'), 2)
+)
+
+flat_items_with_total.show(truncate=False)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 7.5  Aggregate After Explode
+
+# COMMAND ----------
+
+from pyspark.sql.functions import sum as spark_sum, count
+
+# Total revenue per order
+flat_items_with_total.groupBy('order_id', 'customer') \
+    .agg(
+        spark_sum('line_total').alias('order_total'),
+        count('product_id').alias('num_items')
+    ) \
+    .orderBy('order_total', ascending=False) \
+    .show()
+
+# COMMAND ----------
+
+# Most purchased product by total qty
+flat_items_with_total.groupBy('product_name') \
+    .agg(spark_sum('qty').alias('total_qty')) \
+    .orderBy('total_qty', ascending=False) \
+    .show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## 10. Quick Reference
+# MAGIC
+# MAGIC | Operation | Code |
+# MAGIC |-----------|------|
+# MAGIC | Import all types | `from pyspark.sql.types import StructType, StructField, StringType, ...` |
+# MAGIC | Define flat schema | `StructType([StructField('col', StringType(), True), ...])` |
+# MAGIC | Define nested schema | `StructField('addr', StructType([StructField('city', StringType(), True)]), True)` |
+# MAGIC | Array of structs | `StructField('items', ArrayType(StructType([...])), True)` |
+# MAGIC | Access nested field | `col('parent.child')` or `'parent.child'` in select |
+# MAGIC | Filter on nested field | `df.filter(col('parent.child') == 'value')` |
+# MAGIC | Flatten struct | Select each sub-field with `.alias()` |
+# MAGIC | Build struct from flat cols | `struct(col('a').alias('x'), col('b').alias('y'))` |
+# MAGIC | Parse JSON string col | `from_json(col('json_col'), schema)` |
+# MAGIC | Struct to JSON string | `to_json(col('struct_col'))` |
+# MAGIC | Explode array | `explode(col('array_col')).alias('item')` |
+# MAGIC | DDL nested syntax | `'customer STRUCT<name: STRING, tier: STRING>'` |
+# MAGIC | Rebuild struct (update) | `withColumn('s', struct(col('s.a'), col('s.b'), lit('new').alias('c')))` |
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ---
+# MAGIC ## 11. Classroom Exercises
+# MAGIC
+# MAGIC **Exercise 1 — Foundation**
+# MAGIC 1. Using `flat_orders_data`, define a `StructType` schema WITHOUT inference.
+# MAGIC 2. Mark `order_id` as `nullable=False`. All other columns nullable.
+# MAGIC 3. Create the DataFrame, run `printSchema()` and confirm nullable flags.
+# MAGIC 4. Add a column `revenue = quantity * unit_price`.
+# MAGIC
+# MAGIC ---
+# MAGIC
+# MAGIC **Exercise 2 — One-Level Nesting**
+# MAGIC 1. Create a dataset of 5 retail stores. Each row has: `store_id`, `store_name`, and a nested struct `location` with fields: `address` (string), `pincode` (string), `state` (string).
+# MAGIC 2. Define the schema with `StructType` including the nested location struct.
+# MAGIC 3. Filter stores where `location.state == 'Telangana'`.
+# MAGIC 4. Flatten the struct — extract all location fields as top-level columns.
+# MAGIC
+# MAGIC ---
+# MAGIC
+# MAGIC **Exercise 3 — from_json**
+# MAGIC 1. Given these rows:
+# MAGIC ```python
+# MAGIC raw = [
+# MAGIC   ('INV001', '{"vendor":"Tata Agro","city":"Pune","invoice_amount":45000.0}'),
+# MAGIC   ('INV002', '{"vendor":"Amul Dairy","city":"Anand","invoice_amount":82000.0}'),
+# MAGIC   ('INV003', '{"vendor":"ITC Foods","city":"Hyderabad","invoice_amount":61500.0}'),
+# MAGIC ]
+# MAGIC ```
+# MAGIC 2. Define a schema for the JSON payload. Parse it with `from_json`.
+# MAGIC 3. Select `order_id`, `data.vendor`, `data.city`, `data.invoice_amount`.
+# MAGIC 4. Filter where `invoice_amount > 50000`.
+# MAGIC
+# MAGIC ---
+# MAGIC
+# MAGIC **Exercise 4 — Array of Structs + Explode**
+# MAGIC 1. Use `items_df` from Section 7.
+# MAGIC 2. Explode `line_items`.
+# MAGIC 3. Add column `line_total = qty * price`.
+# MAGIC 4. Group by `city` and find total revenue per city.
+# MAGIC 5. Bonus: find the most expensive single line item across all orders.
